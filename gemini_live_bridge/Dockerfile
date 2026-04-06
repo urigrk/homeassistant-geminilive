@@ -11,14 +11,14 @@ RUN apk add --no-cache \
     lapack-dev \
     openblas-dev \
     ffmpeg \
-    python3 python3-pip
+    python3 py3-pip
 
 # Set working directory
 WORKDIR /app
 
 # Copy and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy source
 COPY bridge.py .
