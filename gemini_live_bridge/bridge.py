@@ -29,12 +29,14 @@ Configuration is read from environment variables set by run.sh (which reads
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
 import signal
 import textwrap
 import time
+from math import gcd
 from typing import Optional
 
 import aiohttp
@@ -550,13 +552,166 @@ def resample_gemini_to_device(pcm_bytes: bytes) -> bytes:
     if GEMINI_OUT_RATE == DEVICE_SPK_RATE:
         return pcm_bytes
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    # Compute GCD-reduced up/down ratio
-    from math import gcd
-    g = gcd(DEVICE_SPK_RATE, GEMINI_OUT_RATE)
+    g    = gcd(DEVICE_SPK_RATE, GEMINI_OUT_RATE)
     up   = DEVICE_SPK_RATE // g
     down = GEMINI_OUT_RATE  // g
     resampled = resample_poly(samples, up=up, down=down)
     return resampled.astype(np.int16).tobytes()
+
+
+def resample_device_to_mic(pcm_bytes: bytes) -> bytes:
+    """Resample device speaker-rate int16 PCM down to the Gemini mic rate (16 kHz).
+
+    Used to build the AEC reference signal from what is actually sent to the
+    device speaker so it can be compared against what the microphone captures.
+    """
+    if DEVICE_SPK_RATE == GEMINI_IN_RATE:
+        return pcm_bytes
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    g    = gcd(GEMINI_IN_RATE, DEVICE_SPK_RATE)
+    up   = GEMINI_IN_RATE  // g
+    down = DEVICE_SPK_RATE // g
+    resampled = resample_poly(samples, up=up, down=down)
+    return resampled.astype(np.int16).tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Acoustic Echo Canceller
+# ---------------------------------------------------------------------------
+
+class EchoCanceller:
+    """
+    Reference-power-driven acoustic echo suppressor.
+
+    When Gemini's audio is being played through the device speaker, the
+    microphone inevitably picks up some of that audio as echo and sends it
+    back to Gemini — causing Gemini to "hear itself".  This class suppresses
+    that feedback.
+
+    Strategy
+    --------
+    1.  The pacing loop calls ``feed_reference()`` each time a PCM chunk is
+        actually sent to the device (already resampled to DEVICE_SPK_RATE).
+        We immediately down-sample it to GEMINI_IN_RATE (16 kHz) and push it
+        into a sliding ring-buffer that represents the reference signal.
+
+    2.  ``_device_to_gemini`` calls ``process()`` for every mic frame before
+        forwarding it to Gemini.  We look up the reference window that was
+        played ~ACOUSTIC_DELAY_S seconds before this mic frame and compare
+        energy levels:
+
+            echo-to-mic ratio  =  ref_power / mic_power
+
+        A gain in [min_gain, 1.0] is computed from the ratio and applied to
+        the mic signal with a fast-attack / slow-release envelope so there
+        are no audible clicks.
+
+    3.  Barge-in still works: the gain degrades gracefully as the user's
+        voice raises the mic_power significantly above the reference echo.
+
+    Parameters (tunable via env vars)
+    ----------------------------------
+    AEC_SUPPRESS_DB   – peak suppression in dB         (default 20 dB)
+    AEC_DELAY_MS      – acoustic delay estimate in ms  (default 80 ms)
+    AEC_ATTACK_MS     – gain attack time in ms         (default 8 ms)
+    AEC_RELEASE_MS    – gain release time in ms        (default 150 ms)
+    """
+
+    SUPPRESS_DB  = float(os.environ.get("AEC_SUPPRESS_DB",  "20"))
+    DELAY_MS     = float(os.environ.get("AEC_DELAY_MS",     "80"))
+    ATTACK_MS    = float(os.environ.get("AEC_ATTACK_MS",    "8"))
+    RELEASE_MS   = float(os.environ.get("AEC_RELEASE_MS",   "150"))
+    RATE         = GEMINI_IN_RATE                         # 16 000 Hz
+    REF_BUF_SECS = 1.0                                   # reference ring-buffer length
+
+    def __init__(self):
+        buf_len = int(self.REF_BUF_SECS * self.RATE)
+        # Ring-buffer holding the most recent REF_BUF_SECS of speaker audio
+        # at GEMINI_IN_RATE.  deque(maxlen=N) automatically drops oldest entries.
+        self._ref: collections.deque = collections.deque(maxlen=buf_len)
+
+        self._delay   = int(self.DELAY_MS   / 1000.0 * self.RATE)
+        self._att     = np.exp(-1.0 / (self.ATTACK_MS  / 1000.0 * self.RATE))
+        self._rel     = np.exp(-1.0 / (self.RELEASE_MS / 1000.0 * self.RATE))
+        self._min_gain = 10.0 ** (-self.SUPPRESS_DB / 20.0)
+        self._gain    = 1.0          # current smoothed gain
+        self._playing = False        # True while Gemini audio is being sent
+
+        log.info(
+            "AEC enabled  suppress=%.0f dB  delay=%.0f ms  "
+            "attack=%.0f ms  release=%.0f ms",
+            self.SUPPRESS_DB, self.DELAY_MS, self.ATTACK_MS, self.RELEASE_MS,
+        )
+
+    # ------------------------------------------------------------------
+    # Feed reference (called from the pacing loop)
+    # ------------------------------------------------------------------
+
+    def feed_reference(self, pcm_at_spk_rate: bytes) -> None:
+        """Add a chunk of speaker output to the reference ring-buffer.
+
+        ``pcm_at_spk_rate`` is int16 LE mono PCM at DEVICE_SPK_RATE.
+        It is resampled to GEMINI_IN_RATE before being stored.
+        """
+        pcm_16k = resample_device_to_mic(pcm_at_spk_rate)
+        samples  = np.frombuffer(pcm_16k, dtype=np.int16)
+        self._ref.extend(samples.tolist())
+        self._playing = True
+
+    def notify_silent(self) -> None:
+        """Inform the AEC that playback has paused/ended."""
+        self._playing = False
+
+    # ------------------------------------------------------------------
+    # Process microphone audio
+    # ------------------------------------------------------------------
+
+    def process(self, mic_bytes: bytes) -> bytes:
+        """Apply echo suppression to a mic frame.
+
+        ``mic_bytes`` is int16 LE mono PCM at GEMINI_IN_RATE.
+        Returns suppressed audio of the same length.
+        """
+        mic = np.frombuffer(mic_bytes, dtype=np.int16).astype(np.float32)
+        N   = len(mic)
+        avail = len(self._ref)
+
+        # Need at least (delay + N) reference samples to have a valid window
+        if avail < self._delay + N:
+            return mic_bytes
+
+        # Reference block: the N samples that were played ~DELAY ms ago
+        # self._ref is ordered oldest→newest; -1 is most recent.
+        # We want the window [-(delay+N) : -delay] (or [-N:] when delay==0).
+        ref_list = list(self._ref)
+        if self._delay > 0:
+            ref_block = np.array(ref_list[-(self._delay + N) : -self._delay],
+                                 dtype=np.float32)
+        else:
+            ref_block = np.array(ref_list[-N:], dtype=np.float32)
+
+        if len(ref_block) < N:
+            return mic_bytes   # safety guard
+
+        # ----- Gain computation -----
+        mic_pwr = float(np.mean(mic      ** 2)) + 1e-9
+        ref_pwr = float(np.mean(ref_block ** 2)) + 1e-9
+
+        # Echo-to-mic power ratio; high → strong echo → suppress more
+        etr = ref_pwr / mic_pwr
+
+        # Sigmoid-like mapping: gain → min_gain when echo dominates mic
+        target = max(self._min_gain, 1.0 / (1.0 + 6.0 * etr))
+
+        # ----- Smooth gain ramp over the block (avoids clicks) -----
+        alpha = self._att if target < self._gain else self._rel
+        # Exponential decay from current gain to target over N samples
+        final = float(alpha ** N) * self._gain + (1.0 - float(alpha ** N)) * target
+        ramp  = np.linspace(self._gain, final, N, dtype=np.float32)
+        self._gain = final
+
+        out = mic * ramp
+        return np.clip(out, -32768.0, 32767.0).astype(np.int16).tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +727,7 @@ class GeminiSession:
         self.out_queue  = asyncio.Queue()
         self.addr       = device_ws.remote_address
         self.ha         = HAClient()
+        self.aec        = EchoCanceller()
 
     async def run(self):
         log.info("[%s] Device connected", self.addr)
@@ -626,6 +782,9 @@ class GeminiSession:
                 left        = samples_i32[0::2]
                 mono_i16    = (left >> 16).astype(np.int16)
                 pcm_16k     = mono_i16.tobytes()
+
+                # Echo cancellation: suppress Gemini's own voice from the mic
+                pcm_16k = self.aec.process(pcm_16k)
 
                 encoded = base64.b64encode(pcm_16k).decode("ascii")
                 await self.gemini_ws.send(json.dumps({
@@ -697,6 +856,7 @@ class GeminiSession:
                 except asyncio.QueueEmpty:
                     break
             self._interrupt.set()
+            self.aec.notify_silent()
             await self._safe_send(TAG_INTERRUPT)
             return
 
@@ -741,6 +901,7 @@ class GeminiSession:
 
                 if frame == TAG_END_TURN:
                     await self._safe_send(TAG_END_TURN)
+                    self.aec.notify_silent()
                     next_send = time.monotonic()
                     continue
 
@@ -756,6 +917,9 @@ class GeminiSession:
                     chunk    = pcm[i : i + CHUNK_SIZE]
                     duration = len(chunk) / (DEVICE_SPK_RATE * 2.0)
 
+                    # Feed the reference BEFORE sending so the AEC buffer
+                    # leads the mic by at least the network round-trip time.
+                    self.aec.feed_reference(chunk)
                     await self._safe_send(TAG_AUDIO + chunk)
                     next_send += duration
 
