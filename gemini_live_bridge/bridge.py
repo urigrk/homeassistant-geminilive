@@ -595,6 +595,8 @@ def _resample_to_16k(pcm_bytes: bytes, src_rate: int) -> bytes:
 _AEC_FRAME_SAMPLES = 320
 _AEC_FRAME_BYTES   = _AEC_FRAME_SAMPLES * 2   # int16
 _AEC_FILTER_LEN    = 8_000                     # 500 ms tail
+_RTT_PREROLL_BYTES = _AEC_FRAME_BYTES * 4     # ~80 ms @ 16 kHz
+
 
 
 class SpeexAEC:
@@ -626,28 +628,23 @@ class SpeexAEC:
                 self._ref = self._ref[-max_bytes:]
 
     def process_mic(self, mic_pcm: bytes) -> bytes:
-        """
-        Cancel echo from mic_pcm using buffered speaker reference.
-        Returns cleaned int16 PCM of the same length.
-        """
         out = bytearray()
         with self._lock:
             offset = 0
             while offset + _AEC_FRAME_BYTES <= len(mic_pcm):
                 mic_frame = mic_pcm[offset : offset + _AEC_FRAME_BYTES]
 
-                if len(self._ref) >= _AEC_FRAME_BYTES:
+                # Only consume reference once we have enough pre-roll buffered
+                if len(self._ref) >= _AEC_FRAME_BYTES + self._RTT_PREROLL_BYTES:
                     ref_frame = bytes(self._ref[:_AEC_FRAME_BYTES])
                     del self._ref[:_AEC_FRAME_BYTES]
                     cleaned = self._ec.process(ref_frame, mic_frame)
                     out.extend(cleaned)
                 else:
-                    # No reference yet (Gemini hasn't spoken) — pass through
                     out.extend(mic_frame)
 
                 offset += _AEC_FRAME_BYTES
 
-            # Append any trailing sub-frame bytes unchanged
             out.extend(mic_pcm[offset:])
         return bytes(out)
 
@@ -831,12 +828,6 @@ class GeminiSession:
             if data_b64 and mime.startswith("audio/"):
                 pcm_24k     = base64.b64decode(data_b64)
 
-                # Feed a 16 kHz copy into the AEC reference buffer so the
-                # canceller can subtract this from the microphone signal later.
-                if self._aec is not None:
-                    ref_16k = _resample_to_16k(pcm_24k, GEMINI_OUT_RATE)
-                    self._aec.feed_speaker(ref_16k)
-
                 pcm_device  = resample_gemini_to_device(pcm_24k)
                 await self.out_queue.put(TAG_AUDIO + pcm_device)
 
@@ -845,8 +836,6 @@ class GeminiSession:
     # ------------------------------------------------------------------
 
     async def _audio_pacing_loop(self):
-        """Drains the out_queue and sends audio to the device just slightly
-        ahead of real time to maintain a small playback buffer on the ESP32."""
         CHUNK_SIZE = 4096
         try:
             next_send = time.monotonic()
@@ -874,17 +863,20 @@ class GeminiSession:
                     chunk    = pcm[i : i + CHUNK_SIZE]
                     duration = len(chunk) / (DEVICE_SPK_RATE * 2.0)
 
+                    # ✅ Feed AEC reference HERE, when audio is actually dispatched
+                    if self._aec is not None:
+                        ref_16k = _resample_to_16k(chunk, DEVICE_SPK_RATE)
+                        self._aec.feed_speaker(ref_16k)
+
                     await self._safe_send(TAG_AUDIO + chunk)
                     next_send += duration
 
-                    # 50 ms look-ahead buffer for ESP32 jitter absorption
                     sleep_t = next_send - time.monotonic() - 0.050
                     if sleep_t > 0:
                         await asyncio.sleep(sleep_t)
 
         except asyncio.CancelledError:
             pass
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
