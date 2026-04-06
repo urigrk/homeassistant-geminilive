@@ -11,7 +11,7 @@ RUN apk add --no-cache \
     lapack-dev \
     openblas-dev \
     ffmpeg \
-    libspeexdsp-dev \
+    speexdsp-dev \
     python3 py3-pip
 
 # Set working directory
