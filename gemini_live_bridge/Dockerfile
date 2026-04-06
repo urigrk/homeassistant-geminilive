@@ -20,7 +20,14 @@ WORKDIR /app
 
 # Copy and install Python dependencies
 COPY requirements.txt .
+
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip3 download --no-deps --no-cache-dir webrtc-audio-processing -d /tmp/wap && \
+    cd /tmp/wap && \
+    tar xf webrtc-audio-processing-*.tar.gz && \
+    sed -i 's/#include <string>/#include <string>\n#include <cstdint>/' \
+        webrtc-audio-processing-*/src/audio_processing_module.h && \
+    pip3 install --no-cache-dir --break-system-packages /tmp/wap/webrtc-audio-processing-*/
 
 
 COPY bridge.py .
