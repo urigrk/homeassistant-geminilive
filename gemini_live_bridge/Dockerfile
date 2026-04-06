@@ -12,6 +12,7 @@ RUN apk add --no-cache \
     openblas-dev \
     ffmpeg \
     speexdsp-dev \
+    swig \
     python3 py3-pip
 
 # Set working directory
