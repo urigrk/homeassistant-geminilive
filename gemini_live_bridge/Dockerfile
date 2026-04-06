@@ -20,9 +20,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
-# Copy source
-COPY bridge.py .
-COPY run.sh .
-RUN chmod +x run.sh
 
-CMD ["/usr/bin/with-contenv", "bash", "/app/run.sh"]
+COPY bridge.py .
+ 
+# Register as an s6 service.
+# The HA base image already sets ENTRYPOINT ["/init"] (s6-overlay PID 1).
+# Do NOT override CMD — just drop the run script into /etc/services.d/
+# and s6 will supervise it automatically.
+COPY run.sh /etc/services.d/gemini_bridge/run
+RUN chmod a+x /etc/services.d/gemini_bridge/run
