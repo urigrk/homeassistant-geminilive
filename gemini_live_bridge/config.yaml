@@ -53,10 +53,10 @@ schema:
   audio_input_rate: "list(16000)"
   audio_output_rate: "list(48000|24000|16000)"
   log_level: "list(debug|info|warning|error)"
-  aec_suppress_db: int(20)
-  aec_delay_ms: int(80)
-  aec_attack_ms: int(8)
-  aec_release_ms: int(150)
+  aec_suppress_db: 40
+  aec_delay_ms: 150
+  aec_attack_ms: 8
+  aec_release_ms: 150
 
 # Add-on image / build
 build_from:
