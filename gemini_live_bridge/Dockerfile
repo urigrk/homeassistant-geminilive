@@ -13,6 +13,7 @@ RUN apk add --no-cache \
     ffmpeg \
     speexdsp-dev \
     swig \
+    python3-dev \
     python3 py3-pip
 
 # Set working directory
