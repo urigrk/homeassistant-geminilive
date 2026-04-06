@@ -1,4 +1,4 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/bash
 set -e
 
 bashio::log.info "Starting Gemini Live Bridge..."

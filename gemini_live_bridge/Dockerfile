@@ -25,4 +25,4 @@ COPY bridge.py .
 COPY run.sh .
 RUN chmod +x run.sh
 
-CMD ["/app/run.sh"]
+CMD ["/usr/bin/with-contenv", "bash", "/app/run.sh"]

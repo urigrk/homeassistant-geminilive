@@ -41,7 +41,7 @@ options:
 
 schema:
   gemini_api_key: str
-  model: "list(gemini-2.0-flash-live-001|gemini-2.0-flash-exp|gemini-2.5-flash-preview-native-audio-dialog)"
+  model: "list(gemini-2.0-flash-live-001|gemini-2.0-flash-exp|gemini-2.5-flash-preview-native-audio-dialog|gemini-3.1-flash-live-preview)"
   voice: "list(Aoede|Charon|Fenrir|Kore|Puck)"
   bridge_port: "port"
   system_prompt: str
