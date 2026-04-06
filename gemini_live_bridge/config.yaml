@@ -39,6 +39,10 @@ options:
   audio_input_rate: 16000
   audio_output_rate: 48000
   log_level: "info"
+  aec_suppress_db: 40
+  aec_delay_ms: 150
+  aec_attack_ms: 8
+  aec_release_ms: 150
 
 schema:
   gemini_api_key: str
@@ -53,10 +57,10 @@ schema:
   audio_input_rate: "list(16000)"
   audio_output_rate: "list(48000|24000|16000)"
   log_level: "list(debug|info|warning|error)"
-  aec_suppress_db: 40
-  aec_delay_ms: 150
-  aec_attack_ms: 8
-  aec_release_ms: 150
+  aec_suppress_db: int
+  aec_delay_ms: int
+  aec_attack_ms: int
+  aec_release_ms: int
 
 # Add-on image / build
 build_from:
