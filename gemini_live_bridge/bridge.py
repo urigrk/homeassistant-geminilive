@@ -921,7 +921,7 @@ async def main():
         ping_timeout=10,
     ):
         log.info("Bridge ready - waiting for Voice PE devices on :%d", BRIDGE_PORT)
-        log.info("AEC enabled: %s", self._aec is not None)
+        log.info("AEC enabled")
         await stop
 
     log.info("Bridge shut down cleanly")
