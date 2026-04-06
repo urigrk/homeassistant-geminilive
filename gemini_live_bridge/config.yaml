@@ -3,6 +3,12 @@ description: "Connects Home Assistant Voice PE to Gemini Live API with full HA d
 version: "1.2.0"
 slug: "gemini_live_bridge"
 url: "https://github.com/urigrk/homeassistant-geminilive"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
 
 # Requires network access and the HA API
 homeassistant_api: true
