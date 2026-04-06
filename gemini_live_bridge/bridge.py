@@ -37,23 +37,11 @@ import textwrap
 import time
 from typing import Optional
 
-import collections
-import threading
-
 import aiohttp
 import numpy as np
 import websockets
 import websockets.server
 from scipy.signal import resample_poly
-
-# ---------------------------------------------------------------------------
-# Optional echo cancellation via speexdsp
-# ---------------------------------------------------------------------------
-try:
-    from webrtc_audio_processing import AudioProcessingModule as _WebRTCAP
-    _WEBRTC_AVAILABLE = True
-except ImportError:
-    _WEBRTC_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration  (populated from env vars set by run.sh / bashio)
@@ -78,7 +66,6 @@ ENABLE_DEVICE_CONTROL = os.environ.get("ENABLE_DEVICE_CONTROL", "true").lower() 
 ENABLE_CAMERA_ACCESS  = os.environ.get("ENABLE_CAMERA_ACCESS", "true").lower() == "true"
 ENABLE_NOTIFICATIONS  = os.environ.get("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 LOG_LEVEL             = os.environ.get("LOG_LEVEL", "info").upper()
-ECHO_CANCEL           = os.environ.get("ECHO_CANCEL", "true").lower() == "true"
 
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "http://supervisor/core")
 HA_TOKEN    = os.environ.get("HA_TOKEN", "")
@@ -572,67 +559,9 @@ def resample_gemini_to_device(pcm_bytes: bytes) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
-def _resample_to_16k(pcm_bytes: bytes, src_rate: int) -> bytes:
-    """Downsample any int16 PCM to 16 kHz (for AEC reference signal)."""
-    if src_rate == GEMINI_IN_RATE:
-        return pcm_bytes
-    from math import gcd
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    g = gcd(GEMINI_IN_RATE, src_rate)
-    up   = GEMINI_IN_RATE // g
-    down = src_rate // g
-    resampled = resample_poly(samples, up=up, down=down)
-    return resampled.astype(np.int16).tobytes()
-
-
 # ---------------------------------------------------------------------------
-# Acoustic Echo Canceller  (wraps libspeexdsp via the speexdsp pip package)
+# Session: one per connected device
 # ---------------------------------------------------------------------------
-
-#  AEC frame size  : 20 ms @ 16 kHz  = 320 samples = 640 bytes
-
-_AEC_FRAME_SAMPLES = 160
-_AEC_FRAME_BYTES   = _AEC_FRAME_SAMPLES * 2  # int16
-class WebRTCAEC:
-    """
-    Acoustic echo canceller using the WebRTC Audio Processing Module.
-    Feed speaker PCM (far-end) via feed_speaker(), then call process_mic()
-    on every microphone chunk before it goes to Gemini.
-    All audio must be int16 mono 16 kHz.
-    """
-
-    def __init__(self):
-        self._apm = _WebRTCAP(enable_aec=True, enable_ns=True, enable_agc=False)
-        self._apm.set_stream_format(GEMINI_IN_RATE, 1)         # mic: 16 kHz mono
-        self._apm.set_reverse_stream_format(GEMINI_IN_RATE, 1) # ref: 16 kHz mono
-        self._lock = threading.Lock()
-        log.info("AEC: WebRTC APM initialised  frame=%d samples (10 ms)",
-                 _AEC_FRAME_SAMPLES)
-
-    def feed_speaker(self, pcm_16k: bytes) -> None:
-        """Call this for every chunk sent to the speaker (must be 16 kHz int16)."""
-        with self._lock:
-            offset = 0
-            while offset + _AEC_FRAME_BYTES <= len(pcm_16k):
-                frame = pcm_16k[offset : offset + _AEC_FRAME_BYTES]
-                self._apm.process_reverse_stream(frame)
-                offset += _AEC_FRAME_BYTES
-            # sub-frame tail is intentionally dropped — APM only works on 10 ms frames
-
-    def process_mic(self, mic_pcm: bytes) -> bytes:
-        """Cancel echo from mic_pcm. Returns cleaned int16 PCM of the same length."""
-        out = bytearray()
-        with self._lock:
-            offset = 0
-            while offset + _AEC_FRAME_BYTES <= len(mic_pcm):
-                frame = mic_pcm[offset : offset + _AEC_FRAME_BYTES]
-                cleaned = self._apm.process_stream(frame)
-                out.extend(cleaned)
-                offset += _AEC_FRAME_BYTES
-            # pass through any trailing sub-frame bytes unchanged
-            out.extend(mic_pcm[offset:])
-        return bytes(out)
-
 
 class GeminiSession:
     def __init__(self, device_ws: websockets.server.ServerConnection):
@@ -643,18 +572,6 @@ class GeminiSession:
         self.out_queue  = asyncio.Queue()
         self.addr       = device_ws.remote_address
         self.ha         = HAClient()
-
-        # Acoustic echo canceller — suppresses Gemini's own speech from the mic
-        if ECHO_CANCEL:
-            if _WEBRTC_AVAILABLE:
-                self._aec: WebRTCAEC | None = WebRTCAEC()
-                log.info("[%s] Echo cancellation enabled using WebRTC APM", device_ws.remote_address)
-            else:
-                self._aec = None
-                log.warning("[%s] Echo cancellation requested but webrtc-audio-processing "
-                            "is not installed.", device_ws.remote_address)
-        else:
-            self._aec = None
 
     async def run(self):
         log.info("[%s] Device connected", self.addr)
@@ -709,11 +626,6 @@ class GeminiSession:
                 left        = samples_i32[0::2]
                 mono_i16    = (left >> 16).astype(np.int16)
                 pcm_16k     = mono_i16.tobytes()
-
-                # Apply acoustic echo cancellation (removes Gemini's own voice
-                # that leaked from the speaker back into the microphone)
-                if self._aec is not None:
-                    pcm_16k = self._aec.process_mic(pcm_16k)
 
                 encoded = base64.b64encode(pcm_16k).decode("ascii")
                 await self.gemini_ws.send(json.dumps({
@@ -784,10 +696,6 @@ class GeminiSession:
                     self.out_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-            # Flush stale speaker reference so AEC doesn't cancel user speech
-            if self._aec is not None:
-                with self._aec._lock:
-                    self._aec._ref.clear()
             self._interrupt.set()
             await self._safe_send(TAG_INTERRUPT)
             return
@@ -811,7 +719,6 @@ class GeminiSession:
 
             if data_b64 and mime.startswith("audio/"):
                 pcm_24k     = base64.b64decode(data_b64)
-
                 pcm_device  = resample_gemini_to_device(pcm_24k)
                 await self.out_queue.put(TAG_AUDIO + pcm_device)
 
@@ -820,6 +727,8 @@ class GeminiSession:
     # ------------------------------------------------------------------
 
     async def _audio_pacing_loop(self):
+        """Drains the out_queue and sends audio to the device just slightly
+        ahead of real time to maintain a small playback buffer on the ESP32."""
         CHUNK_SIZE = 4096
         try:
             next_send = time.monotonic()
@@ -847,21 +756,17 @@ class GeminiSession:
                     chunk    = pcm[i : i + CHUNK_SIZE]
                     duration = len(chunk) / (DEVICE_SPK_RATE * 2.0)
 
-                    # Feed AEC reference NOW — at actual dispatch time, not queue time.
-                    # Resample from device rate to 16 kHz first.
-                    if self._aec is not None:
-                        ref_16k = _resample_to_16k(chunk, DEVICE_SPK_RATE)
-                        self._aec.feed_speaker(ref_16k)
-
                     await self._safe_send(TAG_AUDIO + chunk)
                     next_send += duration
 
+                    # 50 ms look-ahead buffer for ESP32 jitter absorption
                     sleep_t = next_send - time.monotonic() - 0.050
                     if sleep_t > 0:
                         await asyncio.sleep(sleep_t)
 
         except asyncio.CancelledError:
             pass
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -905,8 +810,7 @@ async def main():
         ping_interval=30,
         ping_timeout=10,
     ):
-        log.info("Bridge ready - waiting for Voice PE devices on :%d", BRIDGE_PORT)
-        log.info("AEC enabled. speexdsp: %s", _SPEEXDSP_AVAILABLE)
+        log.info("V1.0 - Bridge ready - waiting for Voice PE devices on :%d", BRIDGE_PORT)
         await stop
 
     log.info("Bridge shut down cleanly")

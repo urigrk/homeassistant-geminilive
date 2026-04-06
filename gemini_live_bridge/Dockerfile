@@ -5,14 +5,11 @@ FROM $BUILD_FROM
 RUN apk add --no-cache \
     gcc \
     g++ \
-    musl-dev \
     libffi-dev \
     openssl-dev \
     lapack-dev \
     openblas-dev \
     ffmpeg \
-    swig \
-    python3-dev \
     python3 py3-pip
 
 # Set working directory
@@ -22,18 +19,6 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
-RUN pip3 download --no-deps --no-cache-dir webrtc-audio-processing -d /tmp/wap && \
-    cd /tmp/wap && \
-    tar xf webrtc_audio_processing-*.tar.gz && \
-    sed -i 's/#include <string>/#include <string>\n#include <cstdint>/' \
-        webrtc_audio_processing-*/src/audio_processing_module.h && \
-    sed -i 's/#include <execinfo.h>/\/\/ execinfo.h not available on musl/' \
-        webrtc_audio_processing-*/webrtc-audio-processing/webrtc/base/checks.cc && \
-    sed -i 's/backtrace(/\/\/ backtrace(/g' \
-        webrtc_audio_processing-*/webrtc-audio-processing/webrtc/base/checks.cc && \
-    sed -i 's/backtrace_symbols(/\/\/ backtrace_symbols(/g' \
-        webrtc_audio_processing-*/webrtc-audio-processing/webrtc/base/checks.cc && \
-    pip3 install --no-cache-dir --break-system-packages /tmp/wap/webrtc_audio_processing-*/
 
 COPY bridge.py .
  
