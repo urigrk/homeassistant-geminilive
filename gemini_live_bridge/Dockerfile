@@ -10,7 +10,8 @@ RUN apk add --no-cache \
     openssl-dev \
     lapack-dev \
     openblas-dev \
-    ffmpeg
+    ffmpeg \
+    python3 python3-pip
 
 # Set working directory
 WORKDIR /app
