@@ -17,6 +17,7 @@ auth_api: true
 
 ingress: false
 panel_icon: "mdi:microphone-message"
+init: false
 
 # Ports exposed to the host
 ports:
