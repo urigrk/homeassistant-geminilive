@@ -1,0 +1,59 @@
+name: "Gemini Live Bridge"
+description: "Connects Home Assistant Voice PE to Gemini Live API with full HA device control."
+version: "1.2.0"
+slug: "gemini_live_bridge"
+url: "https://github.com/your-repo/gemini-live-bridge"
+
+# Requires network access and the HA API
+homeassistant_api: true
+hassio_api: true
+auth_api: true
+
+ingress: false
+panel_icon: "mdi:microphone-message"
+
+# Ports exposed to the host
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: "WebSocket port for Voice PE devices"
+
+# ---- User-configurable options -----------------------------------------------
+options:
+  gemini_api_key: ""
+  model: "gemini-2.0-flash-live-001"
+  voice: "Aoede"
+  bridge_port: 8765
+  system_prompt: ""
+  language: "en-US"
+  enable_device_control: true
+  enable_camera_access: true
+  enable_notifications: true
+  audio_input_rate: 16000
+  audio_output_rate: 48000
+  log_level: "info"
+
+schema:
+  gemini_api_key: str
+  model: "list(gemini-2.0-flash-live-001|gemini-2.0-flash-exp|gemini-2.5-flash-preview-native-audio-dialog)"
+  voice: "list(Aoede|Charon|Fenrir|Kore|Puck)"
+  bridge_port: "port"
+  system_prompt: str
+  language: "list(en-US|en-GB|de-DE|fr-FR|es-ES|it-IT|ja-JP|ko-KR|pt-BR|zh-CN)"
+  enable_device_control: bool
+  enable_camera_access: bool
+  enable_notifications: bool
+  audio_input_rate: "list(16000)"
+  audio_output_rate: "list(48000|24000|16000)"
+  log_level: "list(debug|info|warning|error)"
+
+# Add-on image / build
+build_from:
+  aarch64: "ghcr.io/home-assistant/aarch64-base-python:3.12"
+  amd64:   "ghcr.io/home-assistant/amd64-base-python:3.12"
+  armhf:   "ghcr.io/home-assistant/armhf-base-python:3.12"
+  armv7:   "ghcr.io/home-assistant/armv7-base-python:3.12"
+  i386:    "ghcr.io/home-assistant/i386-base-python:3.12"
+
+map:
+  - data:rw
