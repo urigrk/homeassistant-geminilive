@@ -617,8 +617,8 @@ class EchoCanceller:
     AEC_RELEASE_MS    – gain release time in ms        (default 150 ms)
     """
 
-    SUPPRESS_DB  = float(os.environ.get("AEC_SUPPRESS_DB",  "20"))
-    DELAY_MS     = float(os.environ.get("AEC_DELAY_MS",     "80"))
+    SUPPRESS_DB  = float(os.environ.get("AEC_SUPPRESS_DB",  "40"))
+    DELAY_MS     = float(os.environ.get("AEC_DELAY_MS",     "150"))
     ATTACK_MS    = float(os.environ.get("AEC_ATTACK_MS",    "8"))
     RELEASE_MS   = float(os.environ.get("AEC_RELEASE_MS",   "150"))
     RATE         = GEMINI_IN_RATE                         # 16 000 Hz

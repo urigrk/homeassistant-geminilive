@@ -1,6 +1,6 @@
 name: "Gemini Live Bridge"
 description: "Connects Home Assistant Voice PE to Gemini Live API with full HA device control."
-version: "1.2.1"
+version: "1.2.2"
 slug: "gemini_live_bridge"
 url: "https://github.com/urigrk/homeassistant-geminilive"
 arch:
@@ -53,6 +53,10 @@ schema:
   audio_input_rate: "list(16000)"
   audio_output_rate: "list(48000|24000|16000)"
   log_level: "list(debug|info|warning|error)"
+  aec_suppress_db: int(20)
+  aec_delay_ms: int(80)
+  aec_attack_ms: int(8)
+  aec_release_ms: int(150)
 
 # Add-on image / build
 build_from:
