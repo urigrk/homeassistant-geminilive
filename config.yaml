@@ -2,7 +2,7 @@ name: "Gemini Live Bridge"
 description: "Connects Home Assistant Voice PE to Gemini Live API with full HA device control."
 version: "1.2.0"
 slug: "gemini_live_bridge"
-url: "https://github.com/your-repo/gemini-live-bridge"
+url: "https://github.com/urigrk/homeassistant-geminilive"
 
 # Requires network access and the HA API
 homeassistant_api: true
