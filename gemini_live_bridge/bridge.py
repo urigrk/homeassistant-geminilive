@@ -6,14 +6,14 @@ Listens for WebSocket connections from Voice PE devices, relays audio to the
 Gemini Live API in real time, and streams Gemini's audio responses back.
 
 Gemini has full access to Home Assistant via function-calling tools:
-  • get_entities        – list/filter entities with state & attributes
-  • get_entity_state    – fetch a single entity's state + attributes
-  • control_device      – call any HA service (turn on/off, set temp, etc.)
-  • get_camera_image    – capture a still from a camera entity (base64 JPEG)
-  • send_notification   – push a persistent notification to the HA dashboard
-  • get_history         – fetch recent state history for an entity
-  • run_script          – trigger a HA script by entity_id
-  • activate_scene      – activate a HA scene
+  • get_entities        - list/filter entities with state & attributes
+  • get_entity_state    - fetch a single entity's state + attributes
+  • control_device      - call any HA service (turn on/off, set temp, etc.)
+  • get_camera_image    - capture a still from a camera entity (base64 JPEG)
+  • send_notification   - push a persistent notification to the HA dashboard
+  • get_history         - fetch recent state history for an entity
+  • run_script          - trigger a HA script by entity_id
+  • activate_scene      - activate a HA scene
 
 Wire protocol (binary WebSocket frames):
 
@@ -37,13 +37,23 @@ import textwrap
 import time
 from typing import Optional
 
+import collections
+import threading
+
 import aiohttp
 import numpy as np
 import websockets
 import websockets.server
-from collections import deque
 from scipy.signal import resample_poly
-from speexdsp import EchoCanceller
+
+# ---------------------------------------------------------------------------
+# Optional echo cancellation via speexdsp
+# ---------------------------------------------------------------------------
+try:
+    from speexdsp import EchoCanceller as _SpeexAEC
+    _SPEEXDSP_AVAILABLE = True
+except ImportError:
+    _SPEEXDSP_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration  (populated from env vars set by run.sh / bashio)
@@ -68,6 +78,7 @@ ENABLE_DEVICE_CONTROL = os.environ.get("ENABLE_DEVICE_CONTROL", "true").lower() 
 ENABLE_CAMERA_ACCESS  = os.environ.get("ENABLE_CAMERA_ACCESS", "true").lower() == "true"
 ENABLE_NOTIFICATIONS  = os.environ.get("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 LOG_LEVEL             = os.environ.get("LOG_LEVEL", "info").upper()
+ECHO_CANCEL           = os.environ.get("ECHO_CANCEL", "true").lower() == "true"
 
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "http://supervisor/core")
 HA_TOKEN    = os.environ.get("HA_TOKEN", "")
@@ -83,13 +94,6 @@ GEMINI_OUT_RATE   = 24_000   # Gemini always outputs 24 kHz
 TAG_AUDIO     = bytes([0x01])
 TAG_INTERRUPT = bytes([0x02])
 TAG_END_TURN  = bytes([0x03])
-
-# Echo cancellation
-# 10 ms frame at 16 kHz; filter covers ~256 ms of echo tail (plenty for a room)
-AEC_FRAME_SAMPLES  = 160    # 10 ms @ 16 kHz
-AEC_FILTER_LENGTH  = 4096   # ~256 ms echo tail
-# Max reference buffer: 3 s worth of 16-kHz samples (safety cap against drift)
-AEC_REF_BUF_MAX    = GEMINI_IN_RATE * 3
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -568,9 +572,86 @@ def resample_gemini_to_device(pcm_bytes: bytes) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
+def _resample_to_16k(pcm_bytes: bytes, src_rate: int) -> bytes:
+    """Downsample any int16 PCM to 16 kHz (for AEC reference signal)."""
+    if src_rate == GEMINI_IN_RATE:
+        return pcm_bytes
+    from math import gcd
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    g = gcd(GEMINI_IN_RATE, src_rate)
+    up   = GEMINI_IN_RATE // g
+    down = src_rate // g
+    resampled = resample_poly(samples, up=up, down=down)
+    return resampled.astype(np.int16).tobytes()
+
+
 # ---------------------------------------------------------------------------
-# Session: one per connected device
+# Acoustic Echo Canceller  (wraps libspeexdsp via the speexdsp pip package)
 # ---------------------------------------------------------------------------
+
+#  AEC frame size  : 20 ms @ 16 kHz  = 320 samples = 640 bytes
+#  AEC filter tail : 500 ms @ 16 kHz = 8000 samples
+#    → long enough to absorb network RTT + acoustic room delay
+_AEC_FRAME_SAMPLES = 320
+_AEC_FRAME_BYTES   = _AEC_FRAME_SAMPLES * 2   # int16
+_AEC_FILTER_LEN    = 8_000                     # 500 ms tail
+
+
+class SpeexAEC:
+    """
+    Feed speaker PCM (reference / far-end) from the Gemini→Device path,
+    then call process_mic() on every microphone chunk before it goes to Gemini.
+
+    All audio must be int16 mono 16 kHz.
+    Thread-safe: uses a simple lock (only needed because the asyncio tasks are
+    scheduled on the same thread, but belt-and-suspenders here costs nothing).
+    """
+
+    def __init__(self):
+        self._ec  = _SpeexAEC(_AEC_FRAME_SAMPLES, _AEC_FILTER_LEN, GEMINI_IN_RATE)
+        self._ref = bytearray()   # ring-buffer of speaker PCM not yet consumed
+        self._lock = threading.Lock()
+        log.info("AEC: speexdsp echo canceller initialised  "
+                 "frame=%d samples  filter=%d samples (%.0f ms)",
+                 _AEC_FRAME_SAMPLES, _AEC_FILTER_LEN,
+                 _AEC_FILTER_LEN * 1000 / GEMINI_IN_RATE)
+
+    def feed_speaker(self, pcm_16k: bytes) -> None:
+        """Call this for every chunk Gemini sends to the speaker (at 16 kHz)."""
+        with self._lock:
+            self._ref.extend(pcm_16k)
+            # Keep at most 2 s of reference to avoid unbounded growth
+            max_bytes = GEMINI_IN_RATE * 2 * 2          # 2 s × 2 bytes/sample
+            if len(self._ref) > max_bytes:
+                self._ref = self._ref[-max_bytes:]
+
+    def process_mic(self, mic_pcm: bytes) -> bytes:
+        """
+        Cancel echo from mic_pcm using buffered speaker reference.
+        Returns cleaned int16 PCM of the same length.
+        """
+        out = bytearray()
+        with self._lock:
+            offset = 0
+            while offset + _AEC_FRAME_BYTES <= len(mic_pcm):
+                mic_frame = mic_pcm[offset : offset + _AEC_FRAME_BYTES]
+
+                if len(self._ref) >= _AEC_FRAME_BYTES:
+                    ref_frame = bytes(self._ref[:_AEC_FRAME_BYTES])
+                    del self._ref[:_AEC_FRAME_BYTES]
+                    cleaned = self._ec.process(ref_frame, mic_frame)
+                    out.extend(cleaned)
+                else:
+                    # No reference yet (Gemini hasn't spoken) — pass through
+                    out.extend(mic_frame)
+
+                offset += _AEC_FRAME_BYTES
+
+            # Append any trailing sub-frame bytes unchanged
+            out.extend(mic_pcm[offset:])
+        return bytes(out)
+
+
 
 class GeminiSession:
     def __init__(self, device_ws: websockets.server.ServerConnection):
@@ -582,13 +663,17 @@ class GeminiSession:
         self.addr       = device_ws.remote_address
         self.ha         = HAClient()
 
-        # Acoustic Echo Cancellation (speexdsp)
-        # _ref_buffer holds speaker samples downsampled to GEMINI_IN_RATE (16 kHz)
-        # that mirror what the device is currently playing back through its speaker.
-        self._echo_canceller = EchoCanceller.create(
-            AEC_FRAME_SAMPLES, AEC_FILTER_LENGTH, GEMINI_IN_RATE
-        )
-        self._ref_buffer: deque = deque(maxlen=AEC_REF_BUF_MAX)
+        # Acoustic echo canceller — suppresses Gemini's own speech from the mic
+        if ECHO_CANCEL and _SPEEXDSP_AVAILABLE:
+            self._aec: SpeexAEC | None = SpeexAEC()
+        else:
+            self._aec = None
+            if ECHO_CANCEL and not _SPEEXDSP_AVAILABLE:
+                log.warning(
+                    "[%s] Echo cancellation requested but speexdsp is not installed. "
+                    "Add 'libspeexdsp-dev' to packages and 'speexdsp' to requirements.txt.",
+                    device_ws.remote_address,
+                )
 
     async def run(self):
         log.info("[%s] Device connected", self.addr)
@@ -642,11 +727,12 @@ class GeminiSession:
                 samples_i32 = np.frombuffer(raw, dtype=np.int32)
                 left        = samples_i32[0::2]
                 mono_i16    = (left >> 16).astype(np.int16)
-
-                # Remove speaker echo before forwarding mic audio to Gemini
-                mono_i16 = self._apply_aec(mono_i16)
-
                 pcm_16k     = mono_i16.tobytes()
+
+                # Apply acoustic echo cancellation (removes Gemini's own voice
+                # that leaked from the speaker back into the microphone)
+                if self._aec is not None:
+                    pcm_16k = self._aec.process_mic(pcm_16k)
 
                 encoded = base64.b64encode(pcm_16k).decode("ascii")
                 await self.gemini_ws.send(json.dumps({
@@ -717,6 +803,10 @@ class GeminiSession:
                     self.out_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            # Flush stale speaker reference so AEC doesn't cancel user speech
+            if self._aec is not None:
+                with self._aec._lock:
+                    self._aec._ref.clear()
             self._interrupt.set()
             await self._safe_send(TAG_INTERRUPT)
             return
@@ -740,6 +830,13 @@ class GeminiSession:
 
             if data_b64 and mime.startswith("audio/"):
                 pcm_24k     = base64.b64decode(data_b64)
+
+                # Feed a 16 kHz copy into the AEC reference buffer so the
+                # canceller can subtract this from the microphone signal later.
+                if self._aec is not None:
+                    ref_16k = _resample_to_16k(pcm_24k, GEMINI_OUT_RATE)
+                    self._aec.feed_speaker(ref_16k)
+
                 pcm_device  = resample_gemini_to_device(pcm_24k)
                 await self.out_queue.put(TAG_AUDIO + pcm_device)
 
@@ -778,7 +875,6 @@ class GeminiSession:
                     duration = len(chunk) / (DEVICE_SPK_RATE * 2.0)
 
                     await self._safe_send(TAG_AUDIO + chunk)
-                    self._push_ref_chunk(chunk)   # keep AEC reference in sync
                     next_send += duration
 
                     # 50 ms look-ahead buffer for ESP32 jitter absorption
@@ -788,58 +884,6 @@ class GeminiSession:
 
         except asyncio.CancelledError:
             pass
-
-    # ------------------------------------------------------------------
-    # Echo cancellation helpers
-    # ------------------------------------------------------------------
-
-    def _push_ref_chunk(self, pcm_bytes: bytes):
-        """Downsample a speaker chunk (DEVICE_SPK_RATE, int16 mono) to
-        GEMINI_IN_RATE and push it into the AEC reference ring buffer.
-        This is called right after each chunk is transmitted to the device
-        so the reference stays in sync with actual playback timing."""
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-        if DEVICE_SPK_RATE != GEMINI_IN_RATE:
-            from math import gcd
-            g    = gcd(GEMINI_IN_RATE, DEVICE_SPK_RATE)
-            up   = GEMINI_IN_RATE  // g
-            down = DEVICE_SPK_RATE // g
-            samples = resample_poly(samples, up=up, down=down)
-        self._ref_buffer.extend(samples.astype(np.int16).tolist())
-
-    def _apply_aec(self, mic_samples: np.ndarray) -> np.ndarray:
-        """Run speexdsp Acoustic Echo Cancellation frame-by-frame.
-
-        mic_samples : int16 numpy array at GEMINI_IN_RATE (16 kHz)
-        Returns     : echo-cancelled int16 numpy array, same length.
-        """
-        n = len(mic_samples)
-        out_frames: list[np.ndarray] = []
-
-        for i in range(0, n, AEC_FRAME_SAMPLES):
-            mic_frame = mic_samples[i : i + AEC_FRAME_SAMPLES]
-            # Pad the last (possibly short) frame to a full AEC frame
-            pad = AEC_FRAME_SAMPLES - len(mic_frame)
-            if pad:
-                mic_frame = np.pad(mic_frame, (0, pad))
-
-            # Pull the matching reference samples; zero-fill if not yet available
-            # (happens briefly at session start before speaker audio arrives)
-            ref_list = [self._ref_buffer.popleft() if self._ref_buffer else 0
-                        for _ in range(AEC_FRAME_SAMPLES)]
-            ref_frame = np.array(ref_list, dtype=np.int16)
-
-            cancelled = self._echo_canceller.process(
-                mic_frame.astype(np.int16).tobytes(),
-                ref_frame.tobytes(),
-            )
-            out_frames.append(np.frombuffer(cancelled, dtype=np.int16))
-
-        if not out_frames:
-            return mic_samples
-
-        result = np.concatenate(out_frames)
-        return result[:n]   # strip any padding we added to the last frame
 
     # ------------------------------------------------------------------
     # Helpers
@@ -884,7 +928,7 @@ async def main():
         ping_interval=30,
         ping_timeout=10,
     ):
-        log.info("Bridge ready – waiting for Voice PE devices on :%d", BRIDGE_PORT)
+        log.info("Bridge ready - waiting for Voice PE devices on :%d", BRIDGE_PORT)
         await stop
 
     log.info("Bridge shut down cleanly")
