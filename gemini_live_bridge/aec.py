@@ -43,6 +43,18 @@ class EchoCanceler:
             return
 
         try:
+            # speexdsp-python imports the deprecated `imp` module which was
+            # removed in Python 3.12. Provide a minimal shim so the import
+            # succeeds on modern interpreters.
+            import sys
+            if "imp" not in sys.modules:
+                try:
+                    import imp  # noqa: F401
+                except ModuleNotFoundError:
+                    import types
+                    shim = types.ModuleType("imp")
+                    shim.load_dynamic = lambda name, path: None  # unused at runtime
+                    sys.modules["imp"] = shim
             from speexdsp import EchoCanceller  # type: ignore
         except Exception as e:
             log.warning("speexdsp not available, AEC disabled: %s", e)
