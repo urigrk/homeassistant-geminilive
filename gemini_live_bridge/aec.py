@@ -50,30 +50,32 @@ log = logging.getLogger(__name__)
 FRAME_SAMPLES = 160
 FRAME_BYTES   = FRAME_SAMPLES * 2
 
-# ~200 ms echo tail. 20 partitions of 10 ms each.
-NUM_PARTITIONS = 20
+# ~320 ms echo tail. 32 partitions of 10 ms each. Generous to absorb
+# ESP32 playback jitter on top of the static AEC_DELAY_MS offset.
+NUM_PARTITIONS = 32
 FFT_SIZE       = 2 * FRAME_SAMPLES   # 320
 NUM_BINS       = FRAME_SAMPLES + 1   # rfft length
 
-# NLMS step size. 0.3–0.7 is the typical safe range; lower = more stable
-# / slower convergence. 0.5 converges in ~0.5 s for a stationary echo
-# path with strong reference, and stays stable through normal speech.
-MU = 0.5
+# NLMS step size. Larger = faster convergence, less stable. 0.7 is the
+# upper edge of "safe" for a constrained PBFDAF.
+MU = 0.7
 
 # Per-bin power-smoothing time constant for the NLMS denominator.
-# 0.9 → ~10-frame (100 ms) average, fast enough to track speech but
-# smooth enough to avoid noisy step sizes.
 P_SMOOTH = 0.9
 
-# Leakage on filter weights — slowly forgets stale taps if the room
-# changes. 0.99995^100 ≈ 0.995/s — negligible during a turn, useful
-# across minutes.
+# Leakage on filter weights — very slow forgetting so the filter
+# adapts to room changes over minutes but does not decay during a turn.
 LEAK = 0.99995
 
-# Double-talk detector threshold. If echo-power / mic-power falls below
-# this, the near-end is dominant and we freeze adaptation. Cancellation
-# (the subtraction) still runs.
-DTD_RATIO = 0.05
+# Adapt only when the reference (Gemini's voice) is energetic enough
+# to actually drive the room/echo path. Below this, there is nothing
+# to learn and adapting on noise would corrupt W.
+REF_ACTIVE_POW = 1e-4   # ≈ -40 dBFS on a [-1, 1] frame
+
+# Double-talk: if mic energy is much greater than reference energy,
+# the near-end speaker is dominant and we freeze adaptation. The
+# subtraction (cancellation) still runs every frame regardless.
+DTD_MIC_TO_REF = 4.0
 
 AEC_ENABLED  = os.environ.get("AEC_ENABLED", "true").lower() == "true"
 AEC_DELAY_MS = int(os.environ.get("AEC_DELAY_MS", "80"))
@@ -86,7 +88,11 @@ class _FDAF:
         self.W = np.zeros((NUM_PARTITIONS, NUM_BINS), dtype=np.complex64)
         self.X = np.zeros((NUM_PARTITIONS, NUM_BINS), dtype=np.complex64)
         self.ref_prev = np.zeros(FRAME_SAMPLES, dtype=np.float32)
-        self.P = np.full(NUM_BINS, 1e-3, dtype=np.float32)
+        self.P = np.full(NUM_BINS, 1e-3, dtype=np.float64)
+        # Running ERLE estimate (mic_pow / err_pow, dB) for logging.
+        self._erle_mic = 1e-9
+        self._erle_err = 1e-9
+        self._erle_log_count = 0
 
     def process(self, mic: np.ndarray, ref: np.ndarray) -> np.ndarray:
         """Process one 10 ms frame. Inputs are float32 in [-1, 1]."""
@@ -104,22 +110,37 @@ class _FDAF:
         y_full = np.fft.irfft(Y, n=FFT_SIZE).astype(np.float32)
         echo = y_full[FRAME_SAMPLES:]  # overlap-save: keep last N
 
-        # 3) Error in time domain.
+        # 3) Error in time domain (cancellation — always runs).
         e = mic - echo
 
-        # 4) Per-bin power normalization across all partitions.
-        Px = np.sum((self.X.real ** 2 + self.X.imag ** 2), axis=0)
-        self.P = P_SMOOTH * self.P + (1.0 - P_SMOOTH) * Px
-        norm = 1.0 / (self.P + 1e-3)
+        # ERLE accounting for periodic logging.
+        mic_pow = float(np.dot(mic, mic))
+        err_pow = float(np.dot(e, e))
+        ref_pow = float(np.dot(ref, ref))
+        self._erle_mic = 0.95 * self._erle_mic + 0.05 * mic_pow
+        self._erle_err = 0.95 * self._erle_err + 0.05 * err_pow
+        self._erle_log_count += 1
+        if self._erle_log_count >= 200:  # ~2 s
+            self._erle_log_count = 0
+            erle_db = 10.0 * np.log10((self._erle_mic + 1e-12) /
+                                      (self._erle_err + 1e-12))
+            log.debug("AEC ERLE ~%.1f dB (mic=%.4f err=%.4f)",
+                      erle_db, self._erle_mic, self._erle_err)
 
-        # 5) Double-talk freeze: if mic energy >> echo energy, near-end
-        #    speech is dominant — keep cancelling but don't adapt.
-        mic_pow = float(np.dot(mic, mic)) + 1e-9
-        echo_pow = float(np.dot(echo, echo)) + 1e-9
-        if echo_pow / mic_pow < DTD_RATIO:
+        # 4) Adapt only when the reference is active and the mic is not
+        #    dominated by near-end speech. Cancellation always runs.
+        if ref_pow < REF_ACTIVE_POW:
+            return e
+        if mic_pow > DTD_MIC_TO_REF * ref_pow:
             return e
 
-        # 6) Zero-padded error spectrum (overlap-save gradient).
+        # 5) Per-bin power normalization across all partitions.
+        Px = np.sum((self.X.real ** 2 + self.X.imag ** 2), axis=0)
+        self.P = P_SMOOTH * self.P + (1.0 - P_SMOOTH) * Px
+        norm = (1.0 / (self.P + 1e-3)).astype(np.float32)
+
+        # 6) Zero-padded error spectrum (overlap-save gradient: zeros in
+        #    the FIRST half, error in the SECOND).
         e_padded = np.empty(FFT_SIZE, dtype=np.float32)
         e_padded[:FRAME_SAMPLES] = 0.0
         e_padded[FRAME_SAMPLES:] = e
@@ -129,7 +150,7 @@ class _FDAF:
         grad = np.conj(self.X) * (MU * norm * E)[None, :]
         W_new = self.W + grad
 
-        # 8) Causal constraint: in time domain, zero the second half of
+        # 8) Causal constraint: in time domain, zero the SECOND half of
         #    each partition's impulse response, then re-FFT. This is
         #    what makes long-tail PBFDAF stable.
         w_time = np.fft.irfft(W_new, n=FFT_SIZE, axis=1)
