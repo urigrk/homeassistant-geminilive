@@ -10,10 +10,10 @@ RUN apk add --no-cache \
     lapack-dev \
     openblas-dev \
     ffmpeg \
-    speexdsp \
     speexdsp-dev \
     swig \
     python3-dev \
+    musl-dev \
     python3 py3-pip
 
 # Set working directory
@@ -22,7 +22,7 @@ WORKDIR /app
 # Copy and install Python dependencies
 COPY requirements.txt .
 
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt \
 
 COPY bridge.py config.py aec.py ha_client.py prompts.py session.py tools.py audio.py ./
  
