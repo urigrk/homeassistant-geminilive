@@ -46,33 +46,33 @@ class EchoCanceler:
             # speexdsp-python imports the deprecated `imp` module which was
             # removed in Python 3.12. Provide a minimal shim so the import
             # succeeds on modern interpreters.
-            import sys
-            if "imp" not in sys.modules:
-                try:
-                    import imp  # noqa: F401
-                except ModuleNotFoundError:
-                    import types
-                    import importlib, importlib.util, os
-                    shim = types.ModuleType("imp")
+            import sys, types, os, importlib, importlib.util, importlib.machinery
+            try:
+                import imp as _imp  # may not exist on 3.12+
+            except ModuleNotFoundError:
+                _imp = types.ModuleType("imp")
+                sys.modules["imp"] = _imp
 
-                    def _find_module(name, path=None):
-                        spec = importlib.machinery.PathFinder.find_spec(name, path)
-                        if spec is None or spec.origin is None:
-                            raise ImportError(name)
-                        ext = os.path.splitext(spec.origin)[1]
-                        return (None, spec.origin, (ext, "rb", 3))
+            def _find_module(name, path=None):
+                spec = importlib.machinery.PathFinder.find_spec(name, path)
+                if spec is None or spec.origin is None:
+                    raise ImportError(name)
+                ext = os.path.splitext(spec.origin)[1]
+                return (None, spec.origin, (ext, "rb", 3))
 
-                    def _load_module(name, file, pathname, description):
-                        spec = importlib.util.spec_from_file_location(name, pathname)
-                        mod = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(mod)
-                        sys.modules[name] = mod
-                        return mod
+            def _load_module(name, file, pathname, description):
+                spec = importlib.util.spec_from_file_location(name, pathname)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                sys.modules[name] = mod
+                return mod
 
-                    shim.find_module = _find_module
-                    shim.load_module = _load_module
-                    shim.load_dynamic = lambda name, path: _load_module(name, None, path, None)
-                    sys.modules["imp"] = shim
+            if not hasattr(_imp, "find_module"):
+                _imp.find_module = _find_module
+            if not hasattr(_imp, "load_module"):
+                _imp.load_module = _load_module
+            if not hasattr(_imp, "load_dynamic"):
+                _imp.load_dynamic = lambda name, path: _load_module(name, None, path, None)
             from speexdsp import EchoCanceller  # type: ignore
         except Exception as e:
             log.warning("speexdsp not available, AEC disabled: %s", e)
