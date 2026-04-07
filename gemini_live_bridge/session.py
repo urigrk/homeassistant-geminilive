@@ -150,6 +150,7 @@ class GeminiSession:
                     "name": name,
                     "response": {"output": content_parts},
                 })
+                log.info("[%s] Tool call response: %s", self.addr, content_parts)
 
             await self.gemini_ws.send(json.dumps({
                 "toolResponse": {"functionResponses": responses}
