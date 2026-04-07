@@ -14,6 +14,7 @@ RUN apk add --no-cache \
     speexdsp-dev \
     swig \
     python3-dev \
+    standard-imp \
     python3 py3-pip
 
 # Set working directory

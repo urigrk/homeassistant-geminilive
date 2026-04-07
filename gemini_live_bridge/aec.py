@@ -52,8 +52,26 @@ class EchoCanceler:
                     import imp  # noqa: F401
                 except ModuleNotFoundError:
                     import types
+                    import importlib, importlib.util, os
                     shim = types.ModuleType("imp")
-                    shim.load_dynamic = lambda name, path: None  # unused at runtime
+
+                    def _find_module(name, path=None):
+                        spec = importlib.machinery.PathFinder.find_spec(name, path)
+                        if spec is None or spec.origin is None:
+                            raise ImportError(name)
+                        ext = os.path.splitext(spec.origin)[1]
+                        return (None, spec.origin, (ext, "rb", 3))
+
+                    def _load_module(name, file, pathname, description):
+                        spec = importlib.util.spec_from_file_location(name, pathname)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        sys.modules[name] = mod
+                        return mod
+
+                    shim.find_module = _find_module
+                    shim.load_module = _load_module
+                    shim.load_dynamic = lambda name, path: _load_module(name, None, path, None)
                     sys.modules["imp"] = shim
             from speexdsp import EchoCanceller  # type: ignore
         except Exception as e:
