@@ -23,6 +23,17 @@ COPY requirements.txt .
 
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
+# webrtc-audio-processing 0.1.3 is missing `#include <cstdint>` in its
+# vendored header, which breaks builds on modern GCC. Patch the sdist
+# before installing.
+RUN mkdir -p /tmp/wap \
+ && pip3 download --no-deps --no-binary=:all: --dest /tmp/wap webrtc-audio-processing==0.1.3 \
+ && tar -xzf /tmp/wap/webrtc?audio?processing-0.1.3.tar.gz -C /tmp/wap \
+ && sed -i 's|#include <string>|#include <string>\n#include <cstdint>|' \
+        /tmp/wap/webrtc_audio_processing-0.1.3/src/audio_processing_module.h \
+ && pip3 install --no-cache-dir --break-system-packages /tmp/wap/webrtc_audio_processing-0.1.3 \
+ && rm -rf /tmp/wap
+
 COPY bridge.py config.py aec.py ha_client.py prompts.py session.py tools.py audio.py ./
  
 # Register as an s6 service.
