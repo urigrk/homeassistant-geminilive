@@ -1,0 +1,4 @@
+__pycache__/
+__paycache__/
+*.py[cod]
+*$py.class
