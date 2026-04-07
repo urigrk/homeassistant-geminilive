@@ -24,7 +24,7 @@ COPY requirements.txt .
 
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY bridge.py .
+COPY bridge.py config.py aec.py ha_client.py prompts.py session.py tools.py .
  
 # Register as an s6 service.
 # The HA base image already sets ENTRYPOINT ["/init"] (s6-overlay PID 1).
