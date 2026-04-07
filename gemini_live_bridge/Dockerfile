@@ -31,6 +31,8 @@ RUN mkdir -p /tmp/wap \
  && tar -xzf /tmp/wap/webrtc?audio?processing-0.1.3.tar.gz -C /tmp/wap \
  && sed -i 's|#include <string>|#include <string>\n#include <cstdint>|' \
         /tmp/wap/webrtc_audio_processing-0.1.3/src/audio_processing_module.h \
+ && sed -i 's|defined(__GLIBCXX__) && !defined(__UCLIBC__)|0|g' \
+        /tmp/wap/webrtc_audio_processing-0.1.3/webrtc-audio-processing/webrtc/base/checks.cc \
  && pip3 install --no-cache-dir --break-system-packages /tmp/wap/webrtc_audio_processing-0.1.3 \
  && rm -rf /tmp/wap
 
