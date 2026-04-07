@@ -10,7 +10,6 @@ RUN apk add --no-cache \
     lapack-dev \
     openblas-dev \
     ffmpeg \
-    speexdsp-dev \
     swig \
     python3-dev \
     musl-dev \
