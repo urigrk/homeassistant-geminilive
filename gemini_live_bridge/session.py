@@ -91,7 +91,7 @@ class GeminiSession:
                 pcm_16k     = mono_i16.tobytes()
 
                 # Acoustic echo cancellation: subtract speaker reference.
-                #pcm_16k = self.aec.process_mic(pcm_16k)
+                pcm_16k = self.aec.process_mic(pcm_16k)
                 if not pcm_16k:
                     continue
 

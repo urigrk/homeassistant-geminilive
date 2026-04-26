@@ -47,12 +47,12 @@ from config import DEVICE_SPK_RATE, GEMINI_IN_RATE
 log = logging.getLogger(__name__)
 
 # 10 ms frames at 16 kHz
-FRAME_SAMPLES = 160
+FRAME_SAMPLES = 320
 FRAME_BYTES   = FRAME_SAMPLES * 2
 
 # ~320 ms echo tail. 32 partitions of 10 ms each. Generous to absorb
 # ESP32 playback jitter on top of the static AEC_DELAY_MS offset.
-NUM_PARTITIONS = 32
+NUM_PARTITIONS = 64
 FFT_SIZE       = 2 * FRAME_SAMPLES   # 320
 NUM_BINS       = FRAME_SAMPLES + 1   # rfft length
 
